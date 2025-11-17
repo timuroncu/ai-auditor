@@ -1,0 +1,8 @@
+# Core dependencies
+semgrep>=1.27.0             # SAST scanning tool
+requests>=2.31.0            # For API calls if needed
+openai>=1.10.0              # OpenAI API client for LLM integration
+python-dotenv>=1.0.0        # Load environment variables (API keys, config)
+
+# Optional, for JSON handling and pretty printing
+rich>=13.0.0                # Nice CLI output for results
