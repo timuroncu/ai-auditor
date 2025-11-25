@@ -116,15 +116,69 @@ The scanner provides:
 
 ## How It Works
 
-1. **Static Analysis**: Semgrep scans the code with 1330+ security rules
-2. **Context Extraction**: For each finding, the tool extracts surrounding code context
-3. **AI Analysis**: GPT-4o-mini evaluates each finding by:
-   - Reading the actual code and context
-   - Understanding the security rule that triggered
-   - Determining if it's a real vulnerability or false positive
-   - Assigning accurate risk levels
-   - Providing actionable remediation advice
-4. **Results**: Only true vulnerabilities are reported, with AI-enhanced insights
+1. **Static Analysis**: Semgrep scans the code with 1330+ security rules and provides dataflow traces
+2. **Program Slicing (NEW!)**: For each finding, an AST-based slicer builds a dataflow-aware program slice:
+   - **Sink Context**: The complete function containing the vulnerability
+   - **Upstream Dataflow**: Backward slice showing how suspicious variables are defined and flow to the sink
+   - **Helpers & Sanitizers**: Any validation/sanitization functions that process the data
+   - **Callers**: Functions that call the vulnerable code (limited to keep size manageable)
+3. **AI Analysis**: GPT-4.1-mini evaluates each finding using the structured program slice:
+   - Analyzes the complete dataflow from source to sink
+   - Identifies input validation and sanitization
+   - Understands helper functions and security controls
+   - Determines if it's a real vulnerability or false positive
+   - Assigns accurate risk levels based on exploit feasibility
+   - Provides specific, actionable remediation advice
+4. **Results**: Only true vulnerabilities are reported, with dataflow-aware insights
+
+## Architecture: Dataflow-Aware Program Slicing
+
+Traditional SAST tools often produce false positives because they analyze code patterns in isolation. This tool uses **AST-based program slicing** to provide rich, dataflow-aware context to the LLM:
+
+### What is Program Slicing?
+
+Instead of sending fixed line ranges (e.g., "first 100 lines + ±50 around the bug"), the tool:
+
+1. **Parses the source code** into an Abstract Syntax Tree (AST)
+2. **Identifies the sink** (the dangerous operation Semgrep flagged)
+3. **Traces suspicious variables** backward through the code
+4. **Builds a backward slice** showing how data flows to the vulnerability
+5. **Includes helper functions** that might sanitize or validate the data
+6. **Adds caller context** to show how data enters the vulnerable function
+
+### Why This Matters
+
+**Example: False Positive Reduction**
+
+```python
+# Line 5: Helper function with validation
+def sanitize_input(user_input):
+    return re.sub(r'[^a-zA-Z0-9]', '', user_input)
+
+# Line 50: Vulnerable-looking code
+def search_user(username):
+    username = sanitize_input(username)  # ← Sanitization happens here!
+    query = f"SELECT * FROM users WHERE name = '{username}'"  # ← Semgrep flags this
+    return db.execute(query)
+```
+
+**Without program slicing:**
+- AI only sees line 52: `query = f"SELECT * FROM users WHERE name = '{username}'"`
+- Looks vulnerable → **FALSE POSITIVE** flagged
+
+**With program slicing:**
+- AI sees the complete dataflow: `user input → sanitize_input() → query`
+- AI reads the `sanitize_input()` function (line 5)
+- Understands the input is sanitized → **CORRECTLY IDENTIFIED AS SAFE**
+
+### Supported Languages
+
+- **Python**: Full AST-based slicing with dataflow analysis
+- **Other languages**: Fallback to intelligent line-based context extraction
+
+### Fallback Strategy
+
+If AST parsing fails (syntax errors, unsupported language, etc.), the system automatically falls back to the previous method (header + context), ensuring the scanner continues to function.
 
 ## Security Note
 
