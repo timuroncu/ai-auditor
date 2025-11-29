@@ -424,7 +424,7 @@ def analyze_vulnerability_with_ai(vulnerability):
         file_path=file_path,
         sink_line=start_line,
         semgrep_dataflow=dataflow_trace,
-        max_lines=600
+        max_lines=1000
     )
     
     # Fallback to old method if slicing fails
