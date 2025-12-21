@@ -3,3 +3,4 @@ semgrep>=1.27.0             # SAST scanning tool
 requests>=2.31.0            # GitHub API calls
 python-dotenv>=1.0.0        # Load environment variables (API keys, config)
 openai>=1.10.0              # OpenAI API client for LLM integration
+anthropic>=0.25.0           # Anthropic Claude API for multi-agent analysis

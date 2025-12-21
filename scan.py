@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+from anthropic import Anthropic
 from program_slicer import build_program_slice
 
 # Load environment variables from .env file
@@ -31,9 +32,13 @@ AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")  # AI-analy
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_repo")  # Temporary directory to clone repo into
 RULES_PATH = os.getenv("RULES_PATH", "auto")  # auto = language-specific rules, or try 'p/security-audit', 'p/owasp-top-ten'
 
-# OpenAI Configuration
+# OpenAI Configuration (Agent 1)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+# Anthropic Claude Configuration (Agent 2 & 3)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 # SSL Configuration (for corporate environments with SSL proxies)
 DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true"
@@ -43,8 +48,11 @@ if DISABLE_SSL_VERIFY:
     os.environ["SEMGREP_DISABLE_CERT_VERIFY"] = "1"
     print("⚠️  SSL certificate verification disabled (corporate proxy mode)")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Initialize OpenAI client (Agent 1)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Initialize Anthropic client (Agent 2 & 3)
+claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # Step 1: Recursively fetch all files in the GitHub repository
 def fetch_repo_files_recursive(path=""):
@@ -394,7 +402,7 @@ def read_code_snippet(lines, vuln_start_line, vuln_end_line, header_lines=100, c
 # Step 5: Analyze a single vulnerability with OpenAI using dataflow-aware program slicing
 def analyze_vulnerability_with_ai(vulnerability):
     """Use OpenAI to analyze if a Semgrep finding is a true positive using AST-based program slicing"""
-    if not client:
+    if not openai_client:
         return {
             "analyzed": False,
             "error": "OpenAI API key not configured"
@@ -482,17 +490,19 @@ Analyze this program slice to determine:
 
 4. **What should be done?** If true positive, provide specific fix. If false positive, explain why it's safe.
 
+**CRITICAL: You MUST vote. Set is_vulnerable to either true or false.**
+
 **Respond ONLY in JSON format:**
 {{
-  "is_vulnerable": true/false,
-  "confidence": "high/medium/low",
-  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-  "reasoning": "Detailed explanation based on dataflow analysis, referencing specific variables, functions, and code sections",
-  "recommendation": "Specific fix or explanation of why it's a false positive"
+  "is_vulnerable": true,
+  "confidence": "high",
+  "risk_level": "MEDIUM",
+  "reasoning": "Detailed explanation based on dataflow analysis",
+  "recommendation": "Specific fix or explanation"
 }}"""
     
     try:
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert specializing in dataflow analysis and code security. You will receive a STRUCTURED PROGRAM SLICE showing: (1) the sink function, (2) upstream dataflow of suspicious variables, (3) helper/sanitizer functions, and (4) callers. Use this dataflow-aware context to accurately identify true vs false positives. Respond only with valid JSON."},
@@ -534,6 +544,300 @@ def read_full_file_for_slicing(file_path: str) -> Optional[str]:
     except Exception as e:
         print(f"  Warning: Could not read {file_path}: {e}")
         return None
+
+
+# Agent 2: SAST Analyzer (Claude-powered)
+def analyze_with_agent_2(vulnerability):
+    """
+    Agent 2: SAST Analyzer (Claude-powered)
+    Analyzes the flagged file and line to vote on whether it's vulnerable
+    """
+    if not claude_client:
+        return {
+            "analyzed": False,
+            "error": "Anthropic API key not configured"
+        }
+    
+    # Extract vulnerability details (including Semgrep metadata)
+    check_id = vulnerability.get('check_id', 'Unknown')
+    severity = vulnerability.get('extra', {}).get('severity', 'N/A')
+    message = vulnerability.get('extra', {}).get('message', 'N/A')
+    file_path = vulnerability.get('path', 'N/A')
+    start_line = vulnerability.get('start', {}).get('line', 1)
+    end_line = vulnerability.get('end', {}).get('line', start_line)
+    
+    # Read the flagged file only (optimized - not entire repo)
+    file_content = read_full_file_for_slicing(file_path)
+    
+    if not file_content:
+        return {
+            "analyzed": False,
+            "error": "Could not read source file"
+        }
+    
+    # For large files, extract smart context
+    lines = file_content.split('\n')
+    if len(file_content) > 50000:
+        # Header + context around flagged line
+        header = "\n".join(lines[:100])
+        start_ctx = max(0, start_line - 60)
+        end_ctx = min(len(lines), end_line + 60)
+        context = "\n".join([f"{i+1:4}: {lines[i]}" for i in range(start_ctx, end_ctx)])
+        code_to_analyze = f"[File Header - First 100 lines]\n{header}\n\n[Flagged Code Context]\n{context}"
+    else:
+        # Small file - send everything with line numbers
+        code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
+    
+    prompt = f"""You are a security expert performing SAST (Static Application Security Testing) analysis.
+
+[SEMGREP DETECTION - What was flagged]
+- Rule ID: {check_id}
+- Severity: {severity}
+- Semgrep's Concern: {message}
+- File: {file_path}
+- Flagged Lines: {start_line}-{end_line}
+
+[YOUR TASK]
+Independently verify if this is a REAL vulnerability by analyzing the actual code.
+Perform your own analysis to determine if this is a true positive or false positive.
+
+[CODE TO ANALYZE]
+```
+{code_to_analyze}
+```
+
+[ANALYSIS INSTRUCTIONS]
+1. **Focus on lines {start_line}-{end_line}** - this is what Semgrep flagged
+2. **Verify the vulnerability**:
+   - Is there actually dangerous code at these lines?
+   - Is user input involved without sanitization?
+   - Are security functions used correctly?
+   - Is there proper validation/escaping?
+
+3. **Look for false positive indicators**:
+   - Input is validated before use
+   - Safe APIs are used (parameterized queries, safe libraries)
+   - Data comes from trusted sources only
+   - Proper encoding/escaping is applied
+
+4. **Consider the context**:
+   - Is this in a security-critical path?
+   - What's the data flow?
+   - Are there compensating controls?
+
+[VOTE]
+Based on YOUR independent analysis, is this a real vulnerability?
+
+**CRITICAL: You MUST vote. Return is_vulnerable as either true or false.**
+
+**Respond with ONLY valid JSON (no markdown, no extra text):**
+{{
+  "is_vulnerable": true,
+  "confidence": "high",
+  "risk_level": "MEDIUM",
+  "reasoning": "Your analysis here",
+  "recommendation": "Your recommendation here"
+}}"""
+    
+    # Combine system message and prompt for Claude
+    full_prompt = """You are a security expert. You MUST respond with ONLY valid JSON.
+
+DO NOT use markdown code blocks. DO NOT add any text before or after the JSON.
+Your entire response must be parseable JSON starting with {{ and ending with }}.
+
+""" + prompt
+    
+    try:
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            temperature=0.3,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        
+        # Extract JSON from Claude's response
+        response_text = response.content[0].text.strip()
+        
+        # Try to extract JSON if wrapped in markdown
+        if response_text.startswith("```"):
+            # Remove markdown code blocks
+            lines = response_text.split('\n')
+            response_text = '\n'.join([line for line in lines if not line.startswith("```")])
+            response_text = response_text.strip()
+        
+        # Parse JSON
+        analysis = json.loads(response_text)
+        
+        # Ensure is_vulnerable is present and boolean
+        if "is_vulnerable" not in analysis:
+            analysis["is_vulnerable"] = False  # Default to false if missing
+        
+        analysis["analyzed"] = True
+        analysis["agent_name"] = "agent_2_sast_analyzer"
+        return analysis
+        
+    except json.JSONDecodeError as e:
+        # JSON parsing failed - return error with no vote
+        return {
+            "analyzed": False,
+            "error": f"JSON decode error: {str(e)}. Response: {response_text[:100] if 'response_text' in locals() else 'N/A'}",
+            "agent_name": "agent_2_sast_analyzer"
+        }
+    except Exception as e:
+        return {
+            "analyzed": False,
+            "error": str(e),
+            "agent_name": "agent_2_sast_analyzer"
+        }
+
+
+# Agent 3: SAST Analyzer (Claude-powered)
+def analyze_with_agent_3(vulnerability):
+    """
+    Agent 3: SAST Analyzer (Claude-powered)
+    Analyzes the flagged file and line to vote on whether it's vulnerable
+    """
+    if not claude_client:
+        return {
+            "analyzed": False,
+            "error": "Anthropic API key not configured"
+        }
+    
+    # Extract vulnerability details (including Semgrep metadata)
+    check_id = vulnerability.get('check_id', 'Unknown')
+    severity = vulnerability.get('extra', {}).get('severity', 'N/A')
+    message = vulnerability.get('extra', {}).get('message', 'N/A')
+    file_path = vulnerability.get('path', 'N/A')
+    start_line = vulnerability.get('start', {}).get('line', 1)
+    end_line = vulnerability.get('end', {}).get('line', start_line)
+    
+    # Read the flagged file only (optimized)
+    file_content = read_full_file_for_slicing(file_path)
+    
+    if not file_content:
+        return {
+            "analyzed": False,
+            "error": "Could not read source file"
+        }
+    
+    # For large files, extract smart context
+    lines = file_content.split('\n')
+    if len(file_content) > 50000:
+        # Header + context around flagged line
+        header = "\n".join(lines[:100])
+        start_ctx = max(0, start_line - 60)
+        end_ctx = min(len(lines), end_line + 60)
+        context = "\n".join([f"{i+1:4}: {lines[i]}" for i in range(start_ctx, end_ctx)])
+        code_to_analyze = f"[File Header]\n{header}\n\n[Flagged Context]\n{context}"
+    else:
+        # Small file - send everything
+        code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
+    
+    prompt = f"""You are a security expert performing SAST (Static Application Security Testing) analysis.
+
+[SEMGREP DETECTION - What was flagged]
+- Rule ID: {check_id}
+- Severity: {severity}
+- Semgrep's Concern: {message}
+- File: {file_path}
+- Flagged Lines: {start_line}-{end_line}
+
+[YOUR TASK]
+Independently verify if this is a REAL vulnerability by analyzing the actual code.
+Perform your own analysis to determine if this is a true positive or false positive.
+
+[CODE TO ANALYZE]
+```
+{code_to_analyze}
+```
+
+[ANALYSIS INSTRUCTIONS]
+1. **Focus on lines {start_line}-{end_line}** - this is what Semgrep flagged
+2. **Verify the vulnerability**:
+   - Is there actually dangerous code at these lines?
+   - Is user input involved without sanitization?
+   - Are security functions used correctly?
+   - Is there proper validation/escaping?
+
+3. **Look for false positive indicators**:
+   - Input is validated before use
+   - Safe APIs are used (parameterized queries, safe libraries)
+   - Data comes from trusted sources only
+   - Proper encoding/escaping is applied
+
+4. **Consider the context**:
+   - Is this in a security-critical path?
+   - What's the data flow?
+   - Are there compensating controls?
+
+[VOTE]
+Based on YOUR independent analysis, is this a real vulnerability?
+
+**CRITICAL: You MUST vote. Return is_vulnerable as either true or false.**
+
+**Respond with ONLY valid JSON (no markdown, no extra text):**
+{{
+  "is_vulnerable": true,
+  "confidence": "high",
+  "risk_level": "MEDIUM",
+  "reasoning": "Your analysis here",
+  "recommendation": "Your recommendation here"
+}}"""
+    
+    # Combine system message and prompt for Claude
+    full_prompt = """You are a security expert. You MUST respond with ONLY valid JSON.
+
+DO NOT use markdown code blocks. DO NOT add any text before or after the JSON.
+Your entire response must be parseable JSON starting with {{ and ending with }}.
+
+""" + prompt
+    
+    try:
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            temperature=0.3,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        
+        # Extract JSON from Claude's response
+        response_text = response.content[0].text.strip()
+        
+        # Try to extract JSON if wrapped in markdown
+        if response_text.startswith("```"):
+            # Remove markdown code blocks
+            lines = response_text.split('\n')
+            response_text = '\n'.join([line for line in lines if not line.startswith("```")])
+            response_text = response_text.strip()
+        
+        # Parse JSON
+        analysis = json.loads(response_text)
+        
+        # Ensure is_vulnerable is present and boolean
+        if "is_vulnerable" not in analysis:
+            analysis["is_vulnerable"] = False  # Default to false if missing
+        
+        analysis["analyzed"] = True
+        analysis["agent_name"] = "agent_3_sast_analyzer"
+        return analysis
+        
+    except json.JSONDecodeError as e:
+        # JSON parsing failed - return error with no vote
+        return {
+            "analyzed": False,
+            "error": f"JSON decode error: {str(e)}. Response: {response_text[:100] if 'response_text' in locals() else 'N/A'}",
+            "agent_name": "agent_3_sast_analyzer"
+        }
+    except Exception as e:
+        return {
+            "analyzed": False,
+            "error": str(e),
+            "agent_name": "agent_3_sast_analyzer"
+        }
 
 
 def analyze_vulnerability_with_ai_fallback(vulnerability, file_content: str):
@@ -592,17 +896,19 @@ def analyze_vulnerability_with_ai_fallback(vulnerability, file_content: str):
 {code_to_send}
 ```
 
+**CRITICAL: You MUST vote. Set is_vulnerable to either true or false.**
+
 Analyze and respond ONLY in JSON format:
 {{
-  "is_vulnerable": true/false,
-  "confidence": "high/medium/low",
-  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
+  "is_vulnerable": true,
+  "confidence": "high",
+  "risk_level": "MEDIUM",
   "reasoning": "Detailed explanation",
   "recommendation": "Specific fix or explanation"
 }}"""
     
     try:
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert. Analyze the code and respond only with valid JSON."},
@@ -623,16 +929,81 @@ Analyze and respond ONLY in JSON format:
             "error": str(e)
         }
 
-# Step 6: Analyze all vulnerabilities with AI
+# Step 6: Calculate voting results for multi-agent system
+def calculate_voting_result(votes_dict):
+    """
+    Calculate the final voting result from multiple agents.
+    
+    Voting logic:
+    - 1/3 votes = Low probability (not a vulnerability)
+    - 2/3 votes = Vulnerability confirmed
+    - 3/3 votes = High confidence vulnerability
+    
+    Args:
+        votes_dict: Dictionary of agent votes {agent_name: True/False/None}
+    
+    Returns:
+        Dictionary with voting summary
+    """
+    # Count votes
+    total_agents = len(votes_dict)
+    votes_for_vulnerable = sum(1 for vote in votes_dict.values() if vote is True)
+    votes_against = sum(1 for vote in votes_dict.values() if vote is False)
+    votes_pending = sum(1 for vote in votes_dict.values() if vote is None)
+    
+    # Determine status
+    if votes_for_vulnerable >= 2:
+        status = "CONFIRMED_VULNERABILITY"
+        confidence = "HIGH" if votes_for_vulnerable == 3 else "MEDIUM"
+        is_vulnerable = True
+    elif votes_for_vulnerable == 1:
+        status = "LOW_PROBABILITY"
+        confidence = "LOW"
+        is_vulnerable = False
+    else:
+        status = "NOT_VULNERABLE"
+        confidence = "HIGH"
+        is_vulnerable = False
+    
+    return {
+        "is_vulnerable": is_vulnerable,
+        "status": status,
+        "confidence": confidence,
+        "votes_for": votes_for_vulnerable,
+        "votes_against": votes_against,
+        "votes_pending": votes_pending,
+        "total_agents": total_agents,
+        "vote_ratio": f"{votes_for_vulnerable}/{total_agents}"
+    }
+
+# Step 7: Analyze all vulnerabilities with AI
 def ai_analyze_results():
-    """Analyze all Semgrep findings with OpenAI"""
-    if not client:
-        print("\n⚠️  OpenAI API key not configured. Skipping AI analysis.")
-        print("   Set OPENAI_API_KEY in your .env file to enable AI analysis.")
+    """Analyze all Semgrep findings with multi-agent voting system (OpenAI + Claude)"""
+    if not openai_client and not claude_client:
+        print("\n⚠️  No AI API keys configured. Skipping AI analysis.")
+        print("   Set OPENAI_API_KEY and/or ANTHROPIC_API_KEY in your .env file.")
+        return
+    
+    if not openai_client:
+        print("\n⚠️  Warning: OpenAI API key not configured. Agent 1 will be disabled.")
+    if not claude_client:
+        print("\n⚠️  Warning: Anthropic API key not configured. Agents 2 & 3 will be disabled.")
         return
     
     print("\n" + "=" * 80)
-    print("🤖 Starting AI Analysis of Semgrep Findings...")
+    print("🤖 Starting Multi-Agent AI Analysis (Voting System)")
+    print("=" * 80)
+    print("📊 Active Agents:")
+    if openai_client:
+        print(f"   ✓ Agent 1: SAST Analyzer - {OPENAI_MODEL}")
+    if claude_client:
+        print(f"   ✓ Agent 2: SAST Analyzer - {CLAUDE_MODEL}")
+        print(f"   ✓ Agent 3: SAST Analyzer - {CLAUDE_MODEL}")
+    print("=" * 80)
+    print("🗳️  Voting Rules:")
+    print("   - 2-3 votes = CONFIRMED VULNERABILITY ✅")
+    print("   - 1 vote   = LOW PROBABILITY ⚠️")
+    print("   - 0 votes  = NOT VULNERABLE ✓")
     print("=" * 80)
     
     # Load Semgrep results
@@ -645,21 +1016,52 @@ def ai_analyze_results():
         print("No vulnerabilities to analyze.")
         return
     
-    print(f"Analyzing {len(vulnerabilities)} findings with {OPENAI_MODEL}...\n")
+    models_used = []
+    if openai_client:
+        models_used.append(f"OpenAI {OPENAI_MODEL}")
+    if claude_client:
+        models_used.append(f"Claude {CLAUDE_MODEL}")
+    
+    print(f"\nAnalyzing {len(vulnerabilities)} findings with: {' + '.join(models_used)}...\n")
     
     analyzed_results = []
-    true_positives = 0
-    false_positives = 0
+    confirmed_vulnerabilities = 0
+    low_probability = 0
+    not_vulnerable = 0
     
     for i, vuln in enumerate(vulnerabilities, 1):
         file_path = vuln.get('path', 'Unknown')
         check_id = vuln.get('check_id', 'Unknown')
+        start_line = vuln.get('start', {}).get('line', 'N/A')
         
-        print(f"[{i}/{len(vulnerabilities)}] Analyzing: {file_path} - {check_id}")
+        print(f"[{i}/{len(vulnerabilities)}] Analyzing: {file_path}:{start_line} - {check_id}")
         
-        ai_analysis = analyze_vulnerability_with_ai(vuln)
+        # Agent 1: SAST Analyzer (OpenAI)
+        print(f"  Agent 1 (SAST Analyzer)...", end='', flush=True)
+        agent_1_analysis = analyze_vulnerability_with_ai(vuln)
+        print(f" {'✓' if agent_1_analysis.get('analyzed') else '✗'}")
         
-        # Combine Semgrep finding with AI analysis
+        # Agent 2: SAST Analyzer (Claude)
+        print(f"  Agent 2 (SAST Analyzer)...", end='', flush=True)
+        agent_2_analysis = analyze_with_agent_2(vuln)
+        print(f" {'✓' if agent_2_analysis.get('analyzed') else '✗'}")
+        
+        # Agent 3: SAST Analyzer (Claude)
+        print(f"  Agent 3 (SAST Analyzer)...", end='', flush=True)
+        agent_3_analysis = analyze_with_agent_3(vuln)
+        print(f" {'✓' if agent_3_analysis.get('analyzed') else '✗'}")
+        
+        # Initialize voting structure - ALL AGENTS VOTE ON SAME FILE:LINE
+        agent_votes = {
+            "agent_1_sast_analyzer": agent_1_analysis.get('is_vulnerable') if agent_1_analysis.get('analyzed') else None,
+            "agent_2_direct_scanner": agent_2_analysis.get('is_vulnerable') if agent_2_analysis.get('analyzed') else None,
+            "agent_3_contextual_reviewer": agent_3_analysis.get('is_vulnerable') if agent_3_analysis.get('analyzed') else None
+        }
+        
+        # Calculate voting result
+        voting_result = calculate_voting_result(agent_votes)
+        
+        # Combine Semgrep finding with ALL agent analyses and voting
         result = {
             "semgrep_finding": {
                 "check_id": check_id,
@@ -668,29 +1070,62 @@ def ai_analyze_results():
                 "file": vuln.get('path', 'N/A'),
                 "line": vuln.get('start', {}).get('line', 'N/A'),
             },
-            "ai_analysis": ai_analysis
+            "agent_analyses": {
+                "agent_1_sast_analyzer": agent_1_analysis,
+                "agent_2_direct_scanner": agent_2_analysis,
+                "agent_3_contextual_reviewer": agent_3_analysis
+            },
+            "voting": {
+                "votes": agent_votes,
+                "result": voting_result
+            }
         }
         
         analyzed_results.append(result)
         
-        if ai_analysis.get('analyzed'):
-            if ai_analysis.get('is_vulnerable'):
-                true_positives += 1
-                print(f"  ✓ TRUE POSITIVE - Risk: {ai_analysis.get('risk_level', 'N/A')}")
-            else:
-                false_positives += 1
-                print(f"  ✗ FALSE POSITIVE")
+        # Count by voting status
+        if voting_result['status'] == 'CONFIRMED_VULNERABILITY':
+            confirmed_vulnerabilities += 1
+            print(f"  🔴 VULNERABILITY CONFIRMED ({voting_result['vote_ratio']}) - Risk: {agent_1_analysis.get('risk_level', 'N/A')}")
+        elif voting_result['status'] == 'LOW_PROBABILITY':
+            low_probability += 1
+            print(f"  🟡 LOW PROBABILITY ({voting_result['vote_ratio']}) - Likely false positive")
         else:
-            print(f"  ⚠ Analysis failed: {ai_analysis.get('error', 'Unknown error')}")
+            not_vulnerable += 1
+            print(f"  🟢 NOT VULNERABLE ({voting_result['vote_ratio']}) - Safe code")
+        
+        # Show individual agent votes
+        votes_display = []
+        for agent, vote in agent_votes.items():
+            if vote is True:
+                votes_display.append(f"✓{agent.split('_')[1]}")
+            elif vote is False:
+                votes_display.append(f"✗{agent.split('_')[1]}")
+            else:
+                votes_display.append(f"?{agent.split('_')[1]}")
+        print(f"  Votes: [{' | '.join(votes_display)}]")
+        print()
     
-    # Save AI analysis results
+    # Save AI analysis results with voting
     output_data = {
         "repository": REPO,
         "branch": BRANCH,
-        "total_findings": len(vulnerabilities),
-        "true_positives": true_positives,
-        "false_positives": false_positives,
-        "model_used": OPENAI_MODEL,
+        "scan_metadata": {
+            "total_findings": len(vulnerabilities),
+            "model_used": OPENAI_MODEL,
+            "agents_active": 3,
+            "agents_total": 3,
+            "agent_details": {
+                "agent_1": f"SAST Analyzer ({OPENAI_MODEL})",
+                "agent_2": f"SAST Analyzer ({CLAUDE_MODEL})",
+                "agent_3": f"SAST Analyzer ({CLAUDE_MODEL})"
+            }
+        },
+        "voting_summary": {
+            "confirmed_vulnerabilities": confirmed_vulnerabilities,
+            "low_probability": low_probability,
+            "not_vulnerable": not_vulnerable
+        },
         "results": analyzed_results
     }
     
@@ -698,15 +1133,16 @@ def ai_analyze_results():
         json.dump(output_data, f, indent=2, ensure_ascii=False)
     
     print("\n" + "=" * 80)
-    print(f"✅ AI Analysis Complete!")
-    print(f"   True Positives: {true_positives}")
-    print(f"   False Positives: {false_positives}")
+    print(f"✅ Multi-Agent Analysis Complete!")
+    print(f"   🔴 Confirmed Vulnerabilities (2-3 votes): {confirmed_vulnerabilities}")
+    print(f"   🟡 Low Probability (1 vote): {low_probability}")
+    print(f"   🟢 Not Vulnerable (0 votes): {not_vulnerable}")
     print(f"   Results saved to: {AI_ANALYSIS_FILE}")
     print("=" * 80)
 
-# Step 7: Display AI-analyzed results
+# Step 8: Display AI-analyzed results with voting information
 def display_ai_results():
-    """Display the AI-analyzed vulnerabilities"""
+    """Display the AI-analyzed vulnerabilities with multi-agent voting results"""
     if not os.path.exists(AI_ANALYSIS_FILE):
         print("\nNo AI analysis file found. Run AI analysis first.")
         return
@@ -715,25 +1151,71 @@ def display_ai_results():
         data = json.load(f)
     
     results = data.get('results', [])
-    true_positives = [r for r in results if r.get('ai_analysis', {}).get('is_vulnerable')]
+    voting_summary = data.get('voting_summary', {})
     
-    if not true_positives:
-        print("\n🎉 No true vulnerabilities found! All findings were false positives.")
+    # Filter confirmed vulnerabilities (2+ votes)
+    confirmed_vulns = [r for r in results if r.get('voting', {}).get('result', {}).get('status') == 'CONFIRMED_VULNERABILITY']
+    
+    if not confirmed_vulns:
+        print("\n🎉 No confirmed vulnerabilities found!")
+        print("   All findings received less than 2/3 votes from security agents.")
         return
     
-    print(f"\n⚠️  Found {len(true_positives)} True Vulnerabilities:")
+    print(f"\n⚠️  Found {len(confirmed_vulns)} Confirmed Vulnerabilities (2-3 votes):")
     print("=" * 80)
     
-    for i, result in enumerate(true_positives, 1):
+    for i, result in enumerate(confirmed_vulns, 1):
         semgrep = result.get('semgrep_finding', {})
-        ai = result.get('ai_analysis', {})
+        voting = result.get('voting', {})
+        vote_result = voting.get('result', {})
+        votes = voting.get('votes', {})
+        
+        agents = result.get('agent_analyses', {})
+        agent_1 = agents.get('agent_1_sast_analyzer', {})
+        agent_2 = agents.get('agent_2_direct_scanner', {})
+        agent_3 = agents.get('agent_3_contextual_reviewer', {})
         
         print(f"\n[{i}] {semgrep.get('check_id', 'Unknown')}")
-        print(f"    File: {semgrep.get('file', 'N/A')} (Line {semgrep.get('line', 'N/A')})")
-        print(f"    Risk Level: {ai.get('risk_level', 'N/A')} (Confidence: {ai.get('confidence', 'N/A')})")
-        print(f"    Reasoning: {ai.get('reasoning', 'N/A')}")
-        print(f"    Fix: {ai.get('recommendation', 'N/A')}")
+        print(f"    📍 Location: {semgrep.get('file', 'N/A')}:{semgrep.get('line', 'N/A')}")
+        print(f"    🗳️  Vote Result: {vote_result.get('vote_ratio', 'N/A')} - {vote_result.get('status', 'N/A')}")
+        
+        # Show individual agent votes
+        print(f"    👥 Agent Votes:")
+        vote_symbols = {True: "✓ VULNERABLE", False: "✗ SAFE", None: "? NO VOTE"}
+        print(f"       Agent 1 (SAST): {vote_symbols.get(votes.get('agent_1_sast_analyzer'), '?')}")
+        print(f"       Agent 2 (Pattern): {vote_symbols.get(votes.get('agent_2_direct_scanner'), '?')}")
+        print(f"       Agent 3 (Context): {vote_symbols.get(votes.get('agent_3_contextual_reviewer'), '?')}")
+        
+        # Show highest risk level from any agent
+        risk_levels = [agent_1.get('risk_level'), agent_2.get('risk_level'), agent_3.get('risk_level')]
+        risk_levels = [r for r in risk_levels if r]
+        highest_risk = max(risk_levels, key=lambda x: {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'INFO': 0}.get(x, 0)) if risk_levels else 'N/A'
+        
+        print(f"    🎯 Risk Level: {highest_risk} (Confidence: {vote_result.get('confidence', 'N/A')})")
+        
+        # Show reasoning from agent who voted vulnerable (prefer Agent 1)
+        reasoning = None
+        recommendation = None
+        if agent_1.get('is_vulnerable'):
+            reasoning = agent_1.get('reasoning', '')
+            recommendation = agent_1.get('recommendation', '')
+        elif agent_2.get('is_vulnerable'):
+            reasoning = agent_2.get('reasoning', '')
+            recommendation = agent_2.get('recommendation', '')
+        elif agent_3.get('is_vulnerable'):
+            reasoning = agent_3.get('reasoning', '')
+            recommendation = agent_3.get('recommendation', '')
+        
+        if reasoning:
+            print(f"    💡 Analysis: {reasoning[:200]}...")
+        if recommendation:
+            print(f"    🔧 Fix: {recommendation[:200]}...")
     
+    print("=" * 80)
+    print(f"\n📊 Final Voting Summary:")
+    print(f"   🔴 Confirmed Vulnerabilities (2-3 votes): {voting_summary.get('confirmed_vulnerabilities', 0)}")
+    print(f"   🟡 Low Probability (1 vote): {voting_summary.get('low_probability', 0)}")
+    print(f"   🟢 Not Vulnerable (0 votes): {voting_summary.get('not_vulnerable', 0)}")
     print("=" * 80)
 
 # Step 8: Clean up the temporary files
