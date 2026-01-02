@@ -9,7 +9,6 @@ import threading
 from typing import Optional
 from dotenv import load_dotenv
 from openai import OpenAI
-from anthropic import Anthropic
 from program_slicer import build_program_slice
 
 # Load environment variables from .env file
@@ -32,13 +31,9 @@ AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")  # AI-analy
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_repo")  # Temporary directory to clone repo into
 RULES_PATH = os.getenv("RULES_PATH", "auto")  # auto = language-specific rules, or try 'p/security-audit', 'p/owasp-top-ten'
 
-# OpenAI Configuration (Agent 1)
+# OpenAI Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
-# Anthropic Claude Configuration (Agent 2 & 3)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 # SSL Configuration (for corporate environments with SSL proxies)
 DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true"
@@ -48,11 +43,8 @@ if DISABLE_SSL_VERIFY:
     os.environ["SEMGREP_DISABLE_CERT_VERIFY"] = "1"
     print("⚠️  SSL certificate verification disabled (corporate proxy mode)")
 
-# Initialize OpenAI client (Agent 1)
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# Initialize Anthropic client (Agent 2 & 3)
-claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Step 1: Recursively fetch all files in the GitHub repository
 def fetch_repo_files_recursive(path=""):
@@ -402,7 +394,7 @@ def read_code_snippet(lines, vuln_start_line, vuln_end_line, header_lines=100, c
 # Step 5: Analyze a single vulnerability with OpenAI using dataflow-aware program slicing
 def analyze_vulnerability_with_ai(vulnerability):
     """Use OpenAI to analyze if a Semgrep finding is a true positive using AST-based program slicing"""
-    if not openai_client:
+    if not client:
         return {
             "analyzed": False,
             "error": "OpenAI API key not configured"
@@ -490,19 +482,17 @@ Analyze this program slice to determine:
 
 4. **What should be done?** If true positive, provide specific fix. If false positive, explain why it's safe.
 
-**CRITICAL: You MUST vote. Set is_vulnerable to either true or false.**
-
 **Respond ONLY in JSON format:**
 {{
-  "is_vulnerable": true,
-  "confidence": "high",
-  "risk_level": "MEDIUM",
-  "reasoning": "Detailed explanation based on dataflow analysis",
-  "recommendation": "Specific fix or explanation"
+  "is_vulnerable": true/false,
+  "confidence": "high/medium/low",
+  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
+  "reasoning": "Detailed explanation based on dataflow analysis, referencing specific variables, functions, and code sections",
+  "recommendation": "Specific fix or explanation of why it's a false positive"
 }}"""
     
     try:
-        response = openai_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert specializing in dataflow analysis and code security. You will receive a STRUCTURED PROGRAM SLICE showing: (1) the sink function, (2) upstream dataflow of suspicious variables, (3) helper/sanitizer functions, and (4) callers. Use this dataflow-aware context to accurately identify true vs false positives. Respond only with valid JSON."},
@@ -546,16 +536,16 @@ def read_full_file_for_slicing(file_path: str) -> Optional[str]:
         return None
 
 
-# Agent 2: SAST Analyzer (Claude-powered)
+# Agent 2: Direct Code Scanner (Pattern-Based Analysis)
 def analyze_with_agent_2(vulnerability):
     """
-    Agent 2: SAST Analyzer (Claude-powered)
+    Agent 2: Direct pattern-based vulnerability scanner
     Analyzes the flagged file and line to vote on whether it's vulnerable
     """
-    if not claude_client:
+    if not client:
         return {
             "analyzed": False,
-            "error": "Anthropic API key not configured"
+            "error": "OpenAI API key not configured"
         }
     
     # Extract vulnerability details (including Semgrep metadata)
@@ -588,7 +578,7 @@ def analyze_with_agent_2(vulnerability):
         # Small file - send everything with line numbers
         code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
     
-    prompt = f"""You are a security expert performing SAST (Static Application Security Testing) analysis.
+    prompt = f"""You are a security expert performing DIRECT CODE ANALYSIS using pattern-based vulnerability detection.
 
 [SEMGREP DETECTION - What was flagged]
 - Rule ID: {check_id}
@@ -599,7 +589,7 @@ def analyze_with_agent_2(vulnerability):
 
 [YOUR TASK]
 Independently verify if this is a REAL vulnerability by analyzing the actual code.
-Perform your own analysis to determine if this is a true positive or false positive.
+Don't just trust Semgrep - do your own analysis.
 
 [CODE TO ANALYZE]
 ```
@@ -626,83 +616,51 @@ Perform your own analysis to determine if this is a true positive or false posit
    - Are there compensating controls?
 
 [VOTE]
-Based on YOUR independent analysis, is this a real vulnerability?
+Based on YOUR analysis (not just Semgrep's opinion), is this a real vulnerability?
 
-**CRITICAL: You MUST vote. Return is_vulnerable as either true or false.**
-
-**Respond with ONLY valid JSON (no markdown, no extra text):**
+**Respond ONLY in JSON**:
 {{
-  "is_vulnerable": true,
-  "confidence": "high",
-  "risk_level": "MEDIUM",
-  "reasoning": "Your analysis here",
-  "recommendation": "Your recommendation here"
+  "is_vulnerable": true/false,
+  "confidence": "high/medium/low",
+  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
+  "reasoning": "Explain YOUR independent analysis of the code at lines {start_line}-{end_line}",
+  "recommendation": "How to fix if vulnerable, or explain why Semgrep was wrong"
 }}"""
     
-    # Combine system message and prompt for Claude
-    full_prompt = """You are a security expert. You MUST respond with ONLY valid JSON.
-
-DO NOT use markdown code blocks. DO NOT add any text before or after the JSON.
-Your entire response must be parseable JSON starting with {{ and ending with }}.
-
-""" + prompt
-    
     try:
-        response = claude_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2048,
-            temperature=0.3,
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Fast and cost-effective
             messages=[
-                {"role": "user", "content": full_prompt}
-            ]
+                {"role": "system", "content": "You are a cybersecurity expert. Analyze code for vulnerabilities and respond only with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
         
-        # Extract JSON from Claude's response
-        response_text = response.content[0].text.strip()
-        
-        # Try to extract JSON if wrapped in markdown
-        if response_text.startswith("```"):
-            # Remove markdown code blocks
-            lines = response_text.split('\n')
-            response_text = '\n'.join([line for line in lines if not line.startswith("```")])
-            response_text = response_text.strip()
-        
-        # Parse JSON
-        analysis = json.loads(response_text)
-        
-        # Ensure is_vulnerable is present and boolean
-        if "is_vulnerable" not in analysis:
-            analysis["is_vulnerable"] = False  # Default to false if missing
-        
+        analysis = json.loads(response.choices[0].message.content)
         analysis["analyzed"] = True
-        analysis["agent_name"] = "agent_2_sast_analyzer"
+        analysis["agent_name"] = "agent_2_direct_scanner"
         return analysis
         
-    except json.JSONDecodeError as e:
-        # JSON parsing failed - return error with no vote
-        return {
-            "analyzed": False,
-            "error": f"JSON decode error: {str(e)}. Response: {response_text[:100] if 'response_text' in locals() else 'N/A'}",
-            "agent_name": "agent_2_sast_analyzer"
-        }
     except Exception as e:
         return {
             "analyzed": False,
             "error": str(e),
-            "agent_name": "agent_2_sast_analyzer"
+            "agent_name": "agent_2_direct_scanner"
         }
 
 
-# Agent 3: SAST Analyzer (Claude-powered)
+# Agent 3: Contextual Security Reviewer (Architecture-Aware Analysis)
 def analyze_with_agent_3(vulnerability):
     """
-    Agent 3: SAST Analyzer (Claude-powered)
-    Analyzes the flagged file and line to vote on whether it's vulnerable
+    Agent 3: Architecture and context-aware security reviewer
+    Analyzes the flagged file with focus on secure coding practices
     """
-    if not claude_client:
+    if not client:
         return {
             "analyzed": False,
-            "error": "Anthropic API key not configured"
+            "error": "OpenAI API key not configured"
         }
     
     # Extract vulnerability details (including Semgrep metadata)
@@ -735,7 +693,7 @@ def analyze_with_agent_3(vulnerability):
         # Small file - send everything
         code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
     
-    prompt = f"""You are a security expert performing SAST (Static Application Security Testing) analysis.
+    prompt = f"""You are a security architect performing CONTEXTUAL SECURITY REVIEW with focus on real-world exploitability.
 
 [SEMGREP DETECTION - What was flagged]
 - Rule ID: {check_id}
@@ -745,98 +703,73 @@ def analyze_with_agent_3(vulnerability):
 - Flagged Lines: {start_line}-{end_line}
 
 [YOUR TASK]
-Independently verify if this is a REAL vulnerability by analyzing the actual code.
-Perform your own analysis to determine if this is a true positive or false positive.
+Assess whether this is a REAL, EXPLOITABLE vulnerability in a production environment.
+Consider architecture, security controls, and realistic attack scenarios.
 
 [CODE TO ANALYZE]
 ```
 {code_to_analyze}
 ```
 
-[ANALYSIS INSTRUCTIONS]
-1. **Focus on lines {start_line}-{end_line}** - this is what Semgrep flagged
-2. **Verify the vulnerability**:
-   - Is there actually dangerous code at these lines?
-   - Is user input involved without sanitization?
-   - Are security functions used correctly?
-   - Is there proper validation/escaping?
+[REVIEW FOCUS]
 
-3. **Look for false positive indicators**:
-   - Input is validated before use
-   - Safe APIs are used (parameterized queries, safe libraries)
-   - Data comes from trusted sources only
-   - Proper encoding/escaping is applied
+1. **Security Architecture & Controls**:
+   - Are there input validation frameworks in place?
+   - Is output properly encoded/escaped?
+   - Are there authentication/authorization checks?
+   - Does error handling leak sensitive information?
 
-4. **Consider the context**:
-   - Is this in a security-critical path?
-   - What's the data flow?
-   - Are there compensating controls?
+2. **Secure Coding Patterns**:
+   - Parameterized queries vs string concatenation?
+   - Use of safe APIs and libraries?
+   - Principle of least privilege applied?
+   - Defense in depth (multiple security layers)?
+
+3. **Real-World Context**:
+   - Is this code user-facing or internal only?
+   - What's the data flow and trust boundaries?
+   - Are there compensating controls elsewhere in the codebase?
+   - Is the vulnerable code path even reachable?
+
+4. **Exploitability Assessment**:
+   - Can an attacker actually trigger this code?
+   - Is untrusted user input involved?
+   - What's the realistic impact (data breach, RCE, etc.)?
+   - Are there existing mitigations that reduce risk?
 
 [VOTE]
-Based on YOUR independent analysis, is this a real vulnerability?
+Based on security architecture analysis, is this an EXPLOITABLE vulnerability in a real deployment?
 
-**CRITICAL: You MUST vote. Return is_vulnerable as either true or false.**
-
-**Respond with ONLY valid JSON (no markdown, no extra text):**
+**Respond ONLY in JSON**:
 {{
-  "is_vulnerable": true,
-  "confidence": "high",
-  "risk_level": "MEDIUM",
-  "reasoning": "Your analysis here",
-  "recommendation": "Your recommendation here"
+  "is_vulnerable": true/false,
+  "confidence": "high/medium/low",
+  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
+  "reasoning": "Explain your security architecture assessment focusing on real-world exploitability at lines {start_line}-{end_line}",
+  "recommendation": "Specific architectural guidance or explain why existing controls are sufficient"
 }}"""
     
-    # Combine system message and prompt for Claude
-    full_prompt = """You are a security expert. You MUST respond with ONLY valid JSON.
-
-DO NOT use markdown code blocks. DO NOT add any text before or after the JSON.
-Your entire response must be parseable JSON starting with {{ and ending with }}.
-
-""" + prompt
-    
     try:
-        response = claude_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2048,
-            temperature=0.3,
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Fast and cost-effective
             messages=[
-                {"role": "user", "content": full_prompt}
-            ]
+                {"role": "system", "content": "You are a security architect. Assess code security holistically and respond only with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
         
-        # Extract JSON from Claude's response
-        response_text = response.content[0].text.strip()
-        
-        # Try to extract JSON if wrapped in markdown
-        if response_text.startswith("```"):
-            # Remove markdown code blocks
-            lines = response_text.split('\n')
-            response_text = '\n'.join([line for line in lines if not line.startswith("```")])
-            response_text = response_text.strip()
-        
-        # Parse JSON
-        analysis = json.loads(response_text)
-        
-        # Ensure is_vulnerable is present and boolean
-        if "is_vulnerable" not in analysis:
-            analysis["is_vulnerable"] = False  # Default to false if missing
-        
+        analysis = json.loads(response.choices[0].message.content)
         analysis["analyzed"] = True
-        analysis["agent_name"] = "agent_3_sast_analyzer"
+        analysis["agent_name"] = "agent_3_contextual_reviewer"
         return analysis
         
-    except json.JSONDecodeError as e:
-        # JSON parsing failed - return error with no vote
-        return {
-            "analyzed": False,
-            "error": f"JSON decode error: {str(e)}. Response: {response_text[:100] if 'response_text' in locals() else 'N/A'}",
-            "agent_name": "agent_3_sast_analyzer"
-        }
     except Exception as e:
         return {
             "analyzed": False,
             "error": str(e),
-            "agent_name": "agent_3_sast_analyzer"
+            "agent_name": "agent_3_contextual_reviewer"
         }
 
 
@@ -896,19 +829,17 @@ def analyze_vulnerability_with_ai_fallback(vulnerability, file_content: str):
 {code_to_send}
 ```
 
-**CRITICAL: You MUST vote. Set is_vulnerable to either true or false.**
-
 Analyze and respond ONLY in JSON format:
 {{
-  "is_vulnerable": true,
-  "confidence": "high",
-  "risk_level": "MEDIUM",
+  "is_vulnerable": true/false,
+  "confidence": "high/medium/low",
+  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
   "reasoning": "Detailed explanation",
   "recommendation": "Specific fix or explanation"
 }}"""
     
     try:
-        response = openai_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert. Analyze the code and respond only with valid JSON."},
@@ -978,27 +909,19 @@ def calculate_voting_result(votes_dict):
 
 # Step 7: Analyze all vulnerabilities with AI
 def ai_analyze_results():
-    """Analyze all Semgrep findings with multi-agent voting system (OpenAI + Claude)"""
-    if not openai_client and not claude_client:
-        print("\n⚠️  No AI API keys configured. Skipping AI analysis.")
-        print("   Set OPENAI_API_KEY and/or ANTHROPIC_API_KEY in your .env file.")
-        return
-    
-    if not openai_client:
-        print("\n⚠️  Warning: OpenAI API key not configured. Agent 1 will be disabled.")
-    if not claude_client:
-        print("\n⚠️  Warning: Anthropic API key not configured. Agents 2 & 3 will be disabled.")
+    """Analyze all Semgrep findings with OpenAI using multi-agent voting system"""
+    if not client:
+        print("\n⚠️  OpenAI API key not configured. Skipping AI analysis.")
+        print("   Set OPENAI_API_KEY in your .env file to enable AI analysis.")
         return
     
     print("\n" + "=" * 80)
     print("🤖 Starting Multi-Agent AI Analysis (Voting System)")
     print("=" * 80)
     print("📊 Active Agents:")
-    if openai_client:
-        print(f"   ✓ Agent 1: SAST Analyzer - {OPENAI_MODEL}")
-    if claude_client:
-        print(f"   ✓ Agent 2: SAST Analyzer - {CLAUDE_MODEL}")
-        print(f"   ✓ Agent 3: SAST Analyzer - {CLAUDE_MODEL}")
+    print("   ✓ Agent 1: SAST Result Analyzer (dataflow-aware)")
+    print("   ✓ Agent 2: Direct Pattern Scanner (independent analysis)")
+    print("   ✓ Agent 3: Contextual Security Reviewer (architecture-aware)")
     print("=" * 80)
     print("🗳️  Voting Rules:")
     print("   - 2-3 votes = CONFIRMED VULNERABILITY ✅")
@@ -1016,13 +939,7 @@ def ai_analyze_results():
         print("No vulnerabilities to analyze.")
         return
     
-    models_used = []
-    if openai_client:
-        models_used.append(f"OpenAI {OPENAI_MODEL}")
-    if claude_client:
-        models_used.append(f"Claude {CLAUDE_MODEL}")
-    
-    print(f"\nAnalyzing {len(vulnerabilities)} findings with: {' + '.join(models_used)}...\n")
+    print(f"\nAnalyzing {len(vulnerabilities)} findings with {OPENAI_MODEL}...\n")
     
     analyzed_results = []
     confirmed_vulnerabilities = 0
@@ -1036,18 +953,18 @@ def ai_analyze_results():
         
         print(f"[{i}/{len(vulnerabilities)}] Analyzing: {file_path}:{start_line} - {check_id}")
         
-        # Agent 1: SAST Analyzer (OpenAI)
+        # Agent 1: SAST Result Analyzer (with program slicing)
         print(f"  Agent 1 (SAST Analyzer)...", end='', flush=True)
         agent_1_analysis = analyze_vulnerability_with_ai(vuln)
         print(f" {'✓' if agent_1_analysis.get('analyzed') else '✗'}")
         
-        # Agent 2: SAST Analyzer (Claude)
-        print(f"  Agent 2 (SAST Analyzer)...", end='', flush=True)
+        # Agent 2: Direct Pattern Scanner
+        print(f"  Agent 2 (Pattern Scanner)...", end='', flush=True)
         agent_2_analysis = analyze_with_agent_2(vuln)
         print(f" {'✓' if agent_2_analysis.get('analyzed') else '✗'}")
         
-        # Agent 3: SAST Analyzer (Claude)
-        print(f"  Agent 3 (SAST Analyzer)...", end='', flush=True)
+        # Agent 3: Contextual Security Reviewer
+        print(f"  Agent 3 (Context Reviewer)...", end='', flush=True)
         agent_3_analysis = analyze_with_agent_3(vuln)
         print(f" {'✓' if agent_3_analysis.get('analyzed') else '✗'}")
         
@@ -1116,9 +1033,9 @@ def ai_analyze_results():
             "agents_active": 3,
             "agents_total": 3,
             "agent_details": {
-                "agent_1": f"SAST Analyzer ({OPENAI_MODEL})",
-                "agent_2": f"SAST Analyzer ({CLAUDE_MODEL})",
-                "agent_3": f"SAST Analyzer ({CLAUDE_MODEL})"
+                "agent_1": "SAST Result Analyzer (gpt-4.1-mini with program slicing)",
+                "agent_2": "Direct Pattern Scanner (gpt-4o-mini)",
+                "agent_3": "Contextual Security Reviewer (gpt-4o-mini)"
             }
         },
         "voting_summary": {

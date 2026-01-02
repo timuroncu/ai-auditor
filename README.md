@@ -1,232 +1,189 @@
 # AI Code Auditor
 
-Multi-agent AI-powered security scanner combining Semgrep static analysis with GPT and Claude models to reduce false positives through consensus voting.
+## Overview
+An AI-powered security scanner that combines Semgrep's static analysis with OpenAI's GPT-4o-mini to intelligently filter false positives and provide accurate vulnerability assessments.
 
 ## Features
 
-- Recursive GitHub repository scanning with full directory structure preservation
-- Semgrep security analysis with 1300+ rules
-- Multi-agent AI voting system (1x GPT + 2x Claude) for false positive reduction
-- AST-based program slicing for Python code analysis
-- Dataflow-aware vulnerability assessment
-- Detailed reporting with risk levels and remediation guidance
+- 🔍 Recursively scans entire GitHub repositories
+- 🛡️ Uses Semgrep's comprehensive security rulesets (1330+ rules)
+- 🤖 AI-powered analysis to reduce false positives
+- 📁 Preserves directory structure during analysis
+- 🔐 Secure configuration via environment variables
+- 📊 Detailed vulnerability reporting with severity levels
+- 🎯 Intelligent risk assessment and remediation suggestions
 
 ## Requirements
-
-- Python 3.9+
+- Python 3.10+
+- pip
 - Semgrep CLI
 - GitHub Personal Access Token
-- OpenAI API Key
-- Anthropic Claude API Key
+- OpenAI API Key (for AI analysis)
 
 ## Installation
 
+1. **Clone the repository:**
 ```bash
 git clone https://github.com/yourusername/ai-auditor.git
 cd ai-auditor
+```
+
+2. **Install dependencies:**
+```bash
 pip install -r requirements.txt
 ```
 
-## Configuration
-
-Create a `.env` file with:
-
+3. **Configure environment:**
 ```bash
-# GitHub Configuration
-REPO=owner/repository-name
-BRANCH=main
-GITHUB_TOKEN=your_github_token
+# Copy the example environment file
+copy env.example.txt .env
 
-# OpenAI Configuration (Agent 1)
-OPENAI_API_KEY=your_openai_key
-OPENAI_MODEL=gpt-4.1-mini
-
-# Anthropic Configuration (Agents 2 & 3)
-ANTHROPIC_API_KEY=your_anthropic_key
-CLAUDE_MODEL=claude-sonnet-4-20250514
-
-# Output Configuration
-OUTPUT_FILE=results.json
-AI_ANALYSIS_FILE=ai_analysis.json
-TEMP_DIR=temp_repo
-RULES_PATH=auto
-
-# SSL Configuration (for corporate proxies)
-DISABLE_SSL_VERIFY=false
+# Edit .env with your credentials:
+# - REPO: owner/repository-name
+# - BRANCH: branch to scan (e.g., main)
+# - GITHUB_TOKEN: your GitHub personal access token
+# - OPENAI_API_KEY: your OpenAI API key
 ```
 
 ## Usage
 
+Run the scanner:
 ```bash
 python scan.py
 ```
 
-The scanner will:
-1. Fetch repository files from GitHub
-2. Run Semgrep static analysis
-3. Analyze findings with 3 AI agents
-4. Report confirmed vulnerabilities (2/3 vote required)
-5. Save results to `results.json` and `ai_analysis.json`
+The script will:
+1. Fetch all files from the specified GitHub repository
+2. Download them to a temporary directory
+3. Run Semgrep security analysis (1330+ rules)
+4. Analyze each finding with AI to filter false positives
+5. Display true vulnerabilities with risk assessments
+6. Save detailed results to `results.json` and `ai_analysis.json`
 
-## Multi-Agent Voting System
+## Configuration
 
-Three AI agents independently analyze each Semgrep finding:
+Edit your `.env` file with these variables:
 
-**Agent 1: OpenAI GPT-4.1-mini**
-- SAST result verification
-- Fast and cost-effective
-- Uses AST-based program slicing for Python
-
-**Agent 2: Claude Sonnet 4**
-- Independent SAST analysis
-- Strong reasoning capabilities
-- Pattern-based vulnerability detection
-
-**Agent 3: Claude Sonnet 4**
-- Independent SAST analysis
-- Architecture-aware review
-- Exploitability assessment
-
-### Voting Rules
-
-- **3/3 or 2/3 votes**: CONFIRMED VULNERABILITY (high/medium confidence)
-- **1/3 vote**: LOW PROBABILITY (likely false positive)
-- **0/3 votes**: NOT VULNERABLE (false positive)
-
-All agents receive identical input (Semgrep metadata + code context) to vote on the same vulnerability. Different AI models provide diverse perspectives and reduce systematic errors.
-
-## How It Works
-
-### 1. Static Analysis
-Semgrep scans code with security rules and provides dataflow traces.
-
-### 2. Program Slicing (Python only)
-For Python files, AST-based slicer extracts:
-- Sink context (function containing vulnerability)
-- Upstream dataflow (backward trace of suspicious variables)
-- Helper/sanitizer functions
-- Caller context
-
-For other languages, uses intelligent line-based context extraction.
-
-### 3. AI Voting
-Three independent agents analyze each finding:
-- Verify vulnerability existence
-- Check for input validation/sanitization
-- Assess real-world exploitability
-- Determine true positive vs false positive
-
-### 4. Consensus Decision
-Only findings with 2+ votes are reported as confirmed vulnerabilities.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REPO` | GitHub repository (owner/repo) | `username/repository-name` |
+| `BRANCH` | Branch to scan | `main` |
+| `GITHUB_TOKEN` | GitHub Personal Access Token | Required |
+| `OPENAI_API_KEY` | OpenAI API Key | Required |
+| `OPENAI_MODEL` | OpenAI model to use | `gpt-4o-mini` |
+| `RULES_PATH` | Semgrep ruleset | `p/ci` |
+| `OUTPUT_FILE` | Semgrep output JSON file | `results.json` |
+| `AI_ANALYSIS_FILE` | AI-analyzed results file | `ai_analysis.json` |
+| `TEMP_DIR` | Temporary download directory | `temp_repo` |
+| `DISABLE_SSL_VERIFY` | Disable SSL verification (corporate proxies) | `false` |
 
 ## API Keys Setup
 
 ### GitHub Token
-1. GitHub Settings > Developer settings > Personal access tokens
-2. Generate new token with `repo` scope
-3. Copy to `.env` as `GITHUB_TOKEN`
+1. Go to GitHub → Settings → Developer settings → Personal access tokens
+2. Generate a new token (classic)
+3. Select scopes:
+   - `repo` (for private repositories)
+   - `public_repo` (for public repositories only)
+4. Copy the token and add it to your `.env` file
 
 ### OpenAI API Key
-1. Visit https://platform.openai.com/api-keys
-2. Create new API key
-3. Copy to `.env` as `OPENAI_API_KEY`
+1. Go to [OpenAI Platform](https://platform.openai.com/api-keys)
+2. Create a new API key
+3. Copy the key and add it to your `.env` file
+4. The tool uses GPT-4o-mini for cost-effective analysis
 
-### Anthropic API Key
-1. Visit https://console.anthropic.com/settings/keys
-2. Create new API key
-3. Copy to `.env` as `ANTHROPIC_API_KEY`
+## Output
 
-## Cost Estimation
+The scanner provides:
 
-Per vulnerability analysis (all 3 agents):
-- Agent 1 (GPT-4.1-mini): ~$0.01-0.02
-- Agent 2 (Claude Sonnet 4): ~$0.10-0.15
-- Agent 3 (Claude Sonnet 4): ~$0.10-0.15
-- **Total**: ~$0.20-0.35 per vulnerability
+### Console Output
+- Real-time scan progress
+- Semgrep findings summary
+- AI analysis progress with true/false positive classification
+- Final vulnerability report with:
+  - Risk level (CRITICAL/HIGH/MEDIUM/LOW/INFO)
+  - AI confidence level
+  - Reasoning for the assessment
+  - Remediation recommendations
 
-For a typical scan with 10 findings: ~$2-3.50
+### Files Generated
+- `results.json` - Raw Semgrep findings
+- `ai_analysis.json` - AI-analyzed results with:
+  - True positives vs false positives count
+  - Detailed analysis for each finding
+  - Risk assessments and fix recommendations
 
-Claude is more expensive but provides superior false positive detection and reasoning capabilities.
+## How It Works
 
-## Output Files
+1. **Static Analysis**: Semgrep scans the code with 1330+ security rules and provides dataflow traces
+2. **Program Slicing (NEW!)**: For each finding, an AST-based slicer builds a dataflow-aware program slice:
+   - **Sink Context**: The complete function containing the vulnerability
+   - **Upstream Dataflow**: Backward slice showing how suspicious variables are defined and flow to the sink
+   - **Helpers & Sanitizers**: Any validation/sanitization functions that process the data
+   - **Callers**: Functions that call the vulnerable code (limited to keep size manageable)
+3. **AI Analysis**: GPT-4.1-mini evaluates each finding using the structured program slice:
+   - Analyzes the complete dataflow from source to sink
+   - Identifies input validation and sanitization
+   - Understands helper functions and security controls
+   - Determines if it's a real vulnerability or false positive
+   - Assigns accurate risk levels based on exploit feasibility
+   - Provides specific, actionable remediation advice
+4. **Results**: Only true vulnerabilities are reported, with dataflow-aware insights
 
-### results.json
-Raw Semgrep findings with:
-- Check IDs and severity levels
-- File paths and line numbers
-- Dataflow traces
-- Rule messages
+## Architecture: Dataflow-Aware Program Slicing
 
-### ai_analysis.json
-AI-analyzed results with:
-- Voting summary (confirmed/low probability/not vulnerable)
-- Individual agent analyses and votes
-- Risk assessments
-- Remediation recommendations
-- Confidence levels
+Traditional SAST tools often produce false positives because they analyze code patterns in isolation. This tool uses **AST-based program slicing** to provide rich, dataflow-aware context to the LLM:
 
-## File Exclusions
+### What is Program Slicing?
 
-The scanner automatically excludes:
-- Binary files (images, videos, archives)
-- Dependencies (node_modules, vendor, .venv)
-- Build outputs (dist, build, target)
-- System files (.DS_Store, Thumbs.db)
-- Media files (.jpg, .png, .mp4, etc.)
-- Documentation (unless it contains code)
+Instead of sending fixed line ranges (e.g., "first 100 lines + ±50 around the bug"), the tool:
 
-## Troubleshooting
+1. **Parses the source code** into an Abstract Syntax Tree (AST)
+2. **Identifies the sink** (the dangerous operation Semgrep flagged)
+3. **Traces suspicious variables** backward through the code
+4. **Builds a backward slice** showing how data flows to the vulnerability
+5. **Includes helper functions** that might sanitize or validate the data
+6. **Adds caller context** to show how data enters the vulnerable function
 
-### SSL Certificate Errors
-If behind corporate proxy, set `DISABLE_SSL_VERIFY=true` in `.env`.
+### Why This Matters
 
-### Semgrep Scanning 0 Files
-The scanner uses `--no-git-ignore` to scan all downloaded files.
+**Example: False Positive Reduction**
 
-### Agent Returning No Vote
-Agents are configured to always return a vote. Check error messages in `ai_analysis.json` for API issues.
+```python
+# Line 5: Helper function with validation
+def sanitize_input(user_input):
+    return re.sub(r'[^a-zA-Z0-9]', '', user_input)
 
-### Model Not Found (404)
-Verify model names in `.env`:
-- OpenAI: `gpt-4.1-mini` or `gpt-4o-mini`
-- Claude: `claude-sonnet-4-20250514` (check your API key has access)
-
-## Security Notes
-
-- Never commit `.env` file (already in `.gitignore`)
-- Temporary files (`temp_repo`) are auto-deleted after scan
-- All API keys should have appropriate rate limits configured
-- GitHub token should have minimal required scopes
-
-## Example Output
-
-```
-[1/10] Analyzing: src/api.py:45 - python.lang.security.injection.sql
-  Agent 1 (SAST Analyzer)... ✓
-  Agent 2 (SAST Analyzer)... ✓
-  Agent 3 (SAST Analyzer)... ✓
-  VULNERABILITY CONFIRMED (3/3) - Risk: HIGH
-
-Final Summary:
-  Confirmed Vulnerabilities (2-3 votes): 3
-  Low Probability (1 vote): 5
-  Not Vulnerable (0 votes): 2
+# Line 50: Vulnerable-looking code
+def search_user(username):
+    username = sanitize_input(username)  # ← Sanitization happens here!
+    query = f"SELECT * FROM users WHERE name = '{username}'"  # ← Semgrep flags this
+    return db.execute(query)
 ```
 
-## Architecture Benefits
+**Without program slicing:**
+- AI only sees line 52: `query = f"SELECT * FROM users WHERE name = '{username}'"`
+- Looks vulnerable → **FALSE POSITIVE** flagged
 
-**Traditional SAST**:
-- High false positive rate
-- No context awareness
-- Pattern matching only
+**With program slicing:**
+- AI sees the complete dataflow: `user input → sanitize_input() → query`
+- AI reads the `sanitize_input()` function (line 5)
+- Understands the input is sanitized → **CORRECTLY IDENTIFIED AS SAFE**
 
-**AI-Auditor**:
-- Multi-agent consensus reduces false positives
-- Dataflow-aware analysis (Python)
-- Context-sensitive reasoning
-- Exploitability assessment
-- Actionable remediation advice
+### Supported Languages
+
+- **Python**: Full AST-based slicing with dataflow analysis
+- **Other languages**: Fallback to intelligent line-based context extraction
+
+### Fallback Strategy
+
+If AST parsing fails (syntax errors, unsupported language, etc.), the system automatically falls back to the previous method (header + context), ensuring the scanner continues to function.
+
+## Security Note
+
+⚠️ Never commit your `.env` file or expose your GitHub token. The `.gitignore` file is configured to exclude sensitive files.
 
 ## License
 
-MIT License - See LICENSE file for details
+See [LICENSE](LICENSE) file for details
