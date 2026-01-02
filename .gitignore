@@ -1,12 +1,6 @@
 # Environment variables
 .env
 
-# Local ML models
-models/
-*.bin
-*.safetensors
-
-
 # Python
 __pycache__/
 *.py[cod]

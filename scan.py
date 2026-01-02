@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from anthropic import Anthropic
 from program_slicer import build_program_slice
-from local_ml_agent import enabled as local_ml_enabled, vote as local_ml_vote
-
 
 # Load environment variables from .env file
 load_dotenv()
