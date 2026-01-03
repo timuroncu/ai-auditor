@@ -9,7 +9,9 @@ import threading
 from typing import Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+import anthropic
 from program_slicer import build_program_slice
+from local_ml_agent import enabled as local_ml_enabled, vote as local_ml_vote
 
 # Load environment variables from .env file
 load_dotenv()
@@ -35,6 +37,10 @@ RULES_PATH = os.getenv("RULES_PATH", "auto")  # auto = language-specific rules, 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+# Anthropic Configuration
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
 # SSL Configuration (for corporate environments with SSL proxies)
 DISABLE_SSL_VERIFY = os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true"
 
@@ -43,8 +49,9 @@ if DISABLE_SSL_VERIFY:
     os.environ["SEMGREP_DISABLE_CERT_VERIFY"] = "1"
     print("⚠️  SSL certificate verification disabled (corporate proxy mode)")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Initialize API clients
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # Step 1: Recursively fetch all files in the GitHub repository
 def fetch_repo_files_recursive(path=""):
@@ -391,10 +398,10 @@ def read_code_snippet(lines, vuln_start_line, vuln_end_line, header_lines=100, c
     
     return "\n".join(snippet_lines)
 
-# Step 5: Analyze a single vulnerability with OpenAI using dataflow-aware program slicing
+# Step 5: Analyze a single vulnerability with OpenAI using dataflow-aware program slicing (Legacy - kept for reference)
 def analyze_vulnerability_with_ai(vulnerability):
     """Use OpenAI to analyze if a Semgrep finding is a true positive using AST-based program slicing"""
-    if not client:
+    if not openai_client:
         return {
             "analyzed": False,
             "error": "OpenAI API key not configured"
@@ -492,7 +499,7 @@ Analyze this program slice to determine:
 }}"""
     
     try:
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert specializing in dataflow analysis and code security. You will receive a STRUCTURED PROGRAM SLICE showing: (1) the sink function, (2) upstream dataflow of suspicious variables, (3) helper/sanitizer functions, and (4) callers. Use this dataflow-aware context to accurately identify true vs false positives. Respond only with valid JSON."},
@@ -536,19 +543,16 @@ def read_full_file_for_slicing(file_path: str) -> Optional[str]:
         return None
 
 
-# Agent 2: Direct Code Scanner (Pattern-Based Analysis)
-def analyze_with_agent_2(vulnerability):
+# =============================================================================
+# UNIFIED MULTI-AGENT VOTING SYSTEM
+# All agents receive the SAME instructions and data, with EQUAL voting power
+# =============================================================================
+
+def build_unified_prompt(vulnerability, code_to_analyze):
     """
-    Agent 2: Direct pattern-based vulnerability scanner
-    Analyzes the flagged file and line to vote on whether it's vulnerable
+    Build the UNIFIED prompt that ALL agents receive.
+    Same instructions, same data, equal voting power.
     """
-    if not client:
-        return {
-            "analyzed": False,
-            "error": "OpenAI API key not configured"
-        }
-    
-    # Extract vulnerability details (including Semgrep metadata)
     check_id = vulnerability.get('check_id', 'Unknown')
     severity = vulnerability.get('extra', {}).get('severity', 'N/A')
     message = vulnerability.get('extra', {}).get('message', 'N/A')
@@ -556,204 +560,84 @@ def analyze_with_agent_2(vulnerability):
     start_line = vulnerability.get('start', {}).get('line', 1)
     end_line = vulnerability.get('end', {}).get('line', start_line)
     
-    # Read the flagged file only (optimized - not entire repo)
+    return f"""You are a security expert analyzing a SAST (Static Application Security Testing) finding from Semgrep.
+
+[SEMGREP FINDING]
+- Rule ID: {check_id}
+- Severity: {severity}
+- Description: {message}
+- File: {file_path}
+- Flagged Lines: {start_line}-{end_line}
+
+[CODE TO ANALYZE]
+```
+{code_to_analyze}
+```
+
+[YOUR TASK]
+Analyze the code and determine if this Semgrep finding is a TRUE POSITIVE (real vulnerability) or FALSE POSITIVE (safe code).
+
+[ANALYSIS CHECKLIST]
+1. Is there actually dangerous code at lines {start_line}-{end_line}?
+2. Is user input involved without proper sanitization?
+3. Are there input validation or security controls in place?
+4. Is the vulnerable code path reachable by an attacker?
+5. What is the realistic impact if exploited?
+
+[DECISION CRITERIA]
+- TRUE POSITIVE: Real vulnerability that can be exploited
+- FALSE POSITIVE: Safe code with proper controls, or not exploitable
+
+**Respond ONLY in valid JSON format:**
+{{
+  "is_vulnerable": true or false,
+  "confidence": "high" or "medium" or "low",
+  "risk_level": "CRITICAL" or "HIGH" or "MEDIUM" or "LOW" or "INFO",
+  "reasoning": "Your detailed analysis explaining why this is or is not a real vulnerability",
+  "recommendation": "Specific fix if vulnerable, or explanation of why it's safe"
+}}"""
+
+
+def prepare_code_context(vulnerability):
+    """Prepare code context for analysis - used by all agents"""
+    file_path = vulnerability.get('path', 'N/A')
+    start_line = vulnerability.get('start', {}).get('line', 1)
+    end_line = vulnerability.get('end', {}).get('line', start_line)
+    
     file_content = read_full_file_for_slicing(file_path)
     
     if not file_content:
-        return {
-            "analyzed": False,
-            "error": "Could not read source file"
-        }
+        return None
     
-    # For large files, extract smart context
     lines = file_content.split('\n')
     if len(file_content) > 50000:
-        # Header + context around flagged line
+        # Large file: header + context around flagged line
         header = "\n".join(lines[:100])
         start_ctx = max(0, start_line - 60)
         end_ctx = min(len(lines), end_line + 60)
         context = "\n".join([f"{i+1:4}: {lines[i]}" for i in range(start_ctx, end_ctx)])
-        code_to_analyze = f"[File Header - First 100 lines]\n{header}\n\n[Flagged Code Context]\n{context}"
+        return f"[File Header - First 100 lines]\n{header}\n\n[Flagged Code Context - Lines {start_ctx+1} to {end_ctx}]\n{context}"
     else:
         # Small file - send everything with line numbers
-        code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
-    
-    prompt = f"""You are a security expert performing DIRECT CODE ANALYSIS using pattern-based vulnerability detection.
-
-[SEMGREP DETECTION - What was flagged]
-- Rule ID: {check_id}
-- Severity: {severity}
-- Semgrep's Concern: {message}
-- File: {file_path}
-- Flagged Lines: {start_line}-{end_line}
-
-[YOUR TASK]
-Independently verify if this is a REAL vulnerability by analyzing the actual code.
-Don't just trust Semgrep - do your own analysis.
-
-[CODE TO ANALYZE]
-```
-{code_to_analyze}
-```
-
-[ANALYSIS INSTRUCTIONS]
-1. **Focus on lines {start_line}-{end_line}** - this is what Semgrep flagged
-2. **Verify the vulnerability**:
-   - Is there actually dangerous code at these lines?
-   - Is user input involved without sanitization?
-   - Are security functions used correctly?
-   - Is there proper validation/escaping?
-
-3. **Look for false positive indicators**:
-   - Input is validated before use
-   - Safe APIs are used (parameterized queries, safe libraries)
-   - Data comes from trusted sources only
-   - Proper encoding/escaping is applied
-
-4. **Consider the context**:
-   - Is this in a security-critical path?
-   - What's the data flow?
-   - Are there compensating controls?
-
-[VOTE]
-Based on YOUR analysis (not just Semgrep's opinion), is this a real vulnerability?
-
-**Respond ONLY in JSON**:
-{{
-  "is_vulnerable": true/false,
-  "confidence": "high/medium/low",
-  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-  "reasoning": "Explain YOUR independent analysis of the code at lines {start_line}-{end_line}",
-  "recommendation": "How to fix if vulnerable, or explain why Semgrep was wrong"
-}}"""
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Fast and cost-effective
-            messages=[
-                {"role": "system", "content": "You are a cybersecurity expert. Analyze code for vulnerabilities and respond only with valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
-        
-        analysis = json.loads(response.choices[0].message.content)
-        analysis["analyzed"] = True
-        analysis["agent_name"] = "agent_2_direct_scanner"
-        return analysis
-        
-    except Exception as e:
-        return {
-            "analyzed": False,
-            "error": str(e),
-            "agent_name": "agent_2_direct_scanner"
-        }
+        return "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
 
 
-# Agent 3: Contextual Security Reviewer (Architecture-Aware Analysis)
-def analyze_with_agent_3(vulnerability):
-    """
-    Agent 3: Architecture and context-aware security reviewer
-    Analyzes the flagged file with focus on secure coding practices
-    """
-    if not client:
+# Agent 1: OpenAI GPT
+def analyze_with_openai(vulnerability, code_context):
+    """Agent 1: OpenAI GPT - Same prompt as all other agents"""
+    if not openai_client:
         return {
             "analyzed": False,
             "error": "OpenAI API key not configured"
         }
     
-    # Extract vulnerability details (including Semgrep metadata)
-    check_id = vulnerability.get('check_id', 'Unknown')
-    severity = vulnerability.get('extra', {}).get('severity', 'N/A')
-    message = vulnerability.get('extra', {}).get('message', 'N/A')
-    file_path = vulnerability.get('path', 'N/A')
-    start_line = vulnerability.get('start', {}).get('line', 1)
-    end_line = vulnerability.get('end', {}).get('line', start_line)
-    
-    # Read the flagged file only (optimized)
-    file_content = read_full_file_for_slicing(file_path)
-    
-    if not file_content:
-        return {
-            "analyzed": False,
-            "error": "Could not read source file"
-        }
-    
-    # For large files, extract smart context
-    lines = file_content.split('\n')
-    if len(file_content) > 50000:
-        # Header + context around flagged line
-        header = "\n".join(lines[:100])
-        start_ctx = max(0, start_line - 60)
-        end_ctx = min(len(lines), end_line + 60)
-        context = "\n".join([f"{i+1:4}: {lines[i]}" for i in range(start_ctx, end_ctx)])
-        code_to_analyze = f"[File Header]\n{header}\n\n[Flagged Context]\n{context}"
-    else:
-        # Small file - send everything
-        code_to_analyze = "\n".join([f"{i+1:4}: {line}" for i, line in enumerate(lines)])
-    
-    prompt = f"""You are a security architect performing CONTEXTUAL SECURITY REVIEW with focus on real-world exploitability.
-
-[SEMGREP DETECTION - What was flagged]
-- Rule ID: {check_id}
-- Severity: {severity}
-- Semgrep's Concern: {message}
-- File: {file_path}
-- Flagged Lines: {start_line}-{end_line}
-
-[YOUR TASK]
-Assess whether this is a REAL, EXPLOITABLE vulnerability in a production environment.
-Consider architecture, security controls, and realistic attack scenarios.
-
-[CODE TO ANALYZE]
-```
-{code_to_analyze}
-```
-
-[REVIEW FOCUS]
-
-1. **Security Architecture & Controls**:
-   - Are there input validation frameworks in place?
-   - Is output properly encoded/escaped?
-   - Are there authentication/authorization checks?
-   - Does error handling leak sensitive information?
-
-2. **Secure Coding Patterns**:
-   - Parameterized queries vs string concatenation?
-   - Use of safe APIs and libraries?
-   - Principle of least privilege applied?
-   - Defense in depth (multiple security layers)?
-
-3. **Real-World Context**:
-   - Is this code user-facing or internal only?
-   - What's the data flow and trust boundaries?
-   - Are there compensating controls elsewhere in the codebase?
-   - Is the vulnerable code path even reachable?
-
-4. **Exploitability Assessment**:
-   - Can an attacker actually trigger this code?
-   - Is untrusted user input involved?
-   - What's the realistic impact (data breach, RCE, etc.)?
-   - Are there existing mitigations that reduce risk?
-
-[VOTE]
-Based on security architecture analysis, is this an EXPLOITABLE vulnerability in a real deployment?
-
-**Respond ONLY in JSON**:
-{{
-  "is_vulnerable": true/false,
-  "confidence": "high/medium/low",
-  "risk_level": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-  "reasoning": "Explain your security architecture assessment focusing on real-world exploitability at lines {start_line}-{end_line}",
-  "recommendation": "Specific architectural guidance or explain why existing controls are sufficient"
-}}"""
+    prompt = build_unified_prompt(vulnerability, code_context)
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Fast and cost-effective
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a security architect. Assess code security holistically and respond only with valid JSON."},
+                {"role": "system", "content": "You are a cybersecurity expert. Analyze the code for vulnerabilities and respond only with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
@@ -762,14 +646,117 @@ Based on security architecture analysis, is this an EXPLOITABLE vulnerability in
         
         analysis = json.loads(response.choices[0].message.content)
         analysis["analyzed"] = True
-        analysis["agent_name"] = "agent_3_contextual_reviewer"
+        analysis["agent_name"] = "openai_gpt"
+        analysis["model"] = OPENAI_MODEL
         return analysis
         
     except Exception as e:
         return {
             "analyzed": False,
             "error": str(e),
-            "agent_name": "agent_3_contextual_reviewer"
+            "agent_name": "openai_gpt"
+        }
+
+
+# Agent 2: Anthropic Claude
+def analyze_with_claude(vulnerability, code_context):
+    """Agent 2: Anthropic Claude - Same prompt as all other agents"""
+    if not anthropic_client:
+        return {
+            "analyzed": False,
+            "error": "Anthropic API key not configured"
+        }
+    
+    prompt = build_unified_prompt(vulnerability, code_context)
+    
+    try:
+        response = anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": f"You are a cybersecurity expert. Analyze the code for vulnerabilities and respond only with valid JSON.\n\n{prompt}"}
+            ]
+        )
+        
+        # Extract text from Claude's response
+        response_text = response.content[0].text
+        
+        # Parse JSON from response (Claude might wrap it in markdown)
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        
+        analysis = json.loads(response_text.strip())
+        analysis["analyzed"] = True
+        analysis["agent_name"] = "anthropic_claude"
+        analysis["model"] = CLAUDE_MODEL
+        return analysis
+        
+    except Exception as e:
+        return {
+            "analyzed": False,
+            "error": str(e),
+            "agent_name": "anthropic_claude"
+        }
+
+
+# Agent 3: Local ML Model (CodeBERT)
+def analyze_with_local_ml(vulnerability, code_context):
+    """Agent 3: Local ML Model - Uses same code context as other agents"""
+    if not local_ml_enabled():
+        return {
+            "analyzed": False,
+            "error": "Local ML not enabled (set LOCAL_ML_ENABLED=true)"
+        }
+    
+    try:
+        # Use the local ML vote function with the same code context
+        ml_result = local_ml_vote(code_context)
+        
+        # Convert ML result to unified format
+        p_vuln = ml_result.get("p_vuln", 0)
+        is_vulnerable = ml_result.get("vote", False)
+        
+        # Determine confidence based on probability distance from threshold
+        if p_vuln > 0.8 or p_vuln < 0.2:
+            confidence = "high"
+        elif p_vuln > 0.65 or p_vuln < 0.35:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        
+        # Determine risk level based on probability
+        if p_vuln >= 0.8:
+            risk_level = "HIGH"
+        elif p_vuln >= 0.6:
+            risk_level = "MEDIUM"
+        elif p_vuln >= 0.4:
+            risk_level = "LOW"
+        else:
+            risk_level = "INFO"
+        
+        return {
+            "analyzed": True,
+            "agent_name": "local_ml_codebert",
+            "model": "CodeBERT-Phase2",
+            "is_vulnerable": is_vulnerable,
+            "confidence": confidence,
+            "risk_level": risk_level,
+            "reasoning": f"Local ML model predicted vulnerability probability: {p_vuln:.2%}",
+            "recommendation": "Verify with manual code review" if is_vulnerable else "Model indicates low vulnerability probability",
+            "ml_details": {
+                "p_vuln": p_vuln,
+                "threshold": ml_result.get("threshold", 0.5),
+                "device": ml_result.get("device", "cpu")
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "analyzed": False,
+            "error": str(e),
+            "agent_name": "local_ml_codebert"
         }
 
 
@@ -839,7 +826,7 @@ Analyze and respond ONLY in JSON format:
 }}"""
     
     try:
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a cybersecurity expert. Analyze the code and respond only with valid JSON."},
@@ -909,21 +896,33 @@ def calculate_voting_result(votes_dict):
 
 # Step 7: Analyze all vulnerabilities with AI
 def ai_analyze_results():
-    """Analyze all Semgrep findings with OpenAI using multi-agent voting system"""
-    if not client:
-        print("\n⚠️  OpenAI API key not configured. Skipping AI analysis.")
-        print("   Set OPENAI_API_KEY in your .env file to enable AI analysis.")
+    """Analyze all Semgrep findings with multi-agent voting system (OpenAI + Claude + Local ML)"""
+    
+    # Check which agents are available
+    agents_available = []
+    if openai_client:
+        agents_available.append(f"OpenAI ({OPENAI_MODEL})")
+    if anthropic_client:
+        agents_available.append(f"Claude ({CLAUDE_MODEL})")
+    if local_ml_enabled():
+        agents_available.append("Local ML (CodeBERT)")
+    
+    if not agents_available:
+        print("\n⚠️  No AI agents configured. Please set up at least one:")
+        print("   - OPENAI_API_KEY for OpenAI GPT")
+        print("   - ANTHROPIC_API_KEY for Claude")
+        print("   - LOCAL_ML_ENABLED=true for Local ML")
         return
     
     print("\n" + "=" * 80)
-    print("🤖 Starting Multi-Agent AI Analysis (Voting System)")
+    print("🤖 Starting Multi-Agent AI Analysis (Unified Voting System)")
     print("=" * 80)
-    print("📊 Active Agents:")
-    print("   ✓ Agent 1: SAST Result Analyzer (dataflow-aware)")
-    print("   ✓ Agent 2: Direct Pattern Scanner (independent analysis)")
-    print("   ✓ Agent 3: Contextual Security Reviewer (architecture-aware)")
+    print("📊 Active Agents (Same Instructions, Same Data, Equal Voting Power):")
+    print(f"   {'✓' if openai_client else '✗'} Agent 1: OpenAI GPT ({OPENAI_MODEL})")
+    print(f"   {'✓' if anthropic_client else '✗'} Agent 2: Anthropic Claude ({CLAUDE_MODEL})")
+    print(f"   {'✓' if local_ml_enabled() else '✗'} Agent 3: Local ML (CodeBERT)")
     print("=" * 80)
-    print("🗳️  Voting Rules:")
+    print("🗳️  Voting Rules (Each agent has 1 vote):")
     print("   - 2-3 votes = CONFIRMED VULNERABILITY ✅")
     print("   - 1 vote   = LOW PROBABILITY ⚠️")
     print("   - 0 votes  = NOT VULNERABLE ✓")
@@ -939,7 +938,7 @@ def ai_analyze_results():
         print("No vulnerabilities to analyze.")
         return
     
-    print(f"\nAnalyzing {len(vulnerabilities)} findings with {OPENAI_MODEL}...\n")
+    print(f"\nAnalyzing {len(vulnerabilities)} findings...\n")
     
     analyzed_results = []
     confirmed_vulnerabilities = 0
@@ -953,26 +952,33 @@ def ai_analyze_results():
         
         print(f"[{i}/{len(vulnerabilities)}] Analyzing: {file_path}:{start_line} - {check_id}")
         
-        # Agent 1: SAST Result Analyzer (with program slicing)
-        print(f"  Agent 1 (SAST Analyzer)...", end='', flush=True)
-        agent_1_analysis = analyze_vulnerability_with_ai(vuln)
+        # Prepare SAME code context for ALL agents
+        code_context = prepare_code_context(vuln)
+        
+        if not code_context:
+            print(f"  ⚠️  Could not read source file, skipping...")
+            continue
+        
+        # Agent 1: OpenAI GPT
+        print(f"  Agent 1 (OpenAI)...", end='', flush=True)
+        agent_1_analysis = analyze_with_openai(vuln, code_context)
         print(f" {'✓' if agent_1_analysis.get('analyzed') else '✗'}")
         
-        # Agent 2: Direct Pattern Scanner
-        print(f"  Agent 2 (Pattern Scanner)...", end='', flush=True)
-        agent_2_analysis = analyze_with_agent_2(vuln)
+        # Agent 2: Anthropic Claude
+        print(f"  Agent 2 (Claude)...", end='', flush=True)
+        agent_2_analysis = analyze_with_claude(vuln, code_context)
         print(f" {'✓' if agent_2_analysis.get('analyzed') else '✗'}")
         
-        # Agent 3: Contextual Security Reviewer
-        print(f"  Agent 3 (Context Reviewer)...", end='', flush=True)
-        agent_3_analysis = analyze_with_agent_3(vuln)
+        # Agent 3: Local ML Model
+        print(f"  Agent 3 (Local ML)...", end='', flush=True)
+        agent_3_analysis = analyze_with_local_ml(vuln, code_context)
         print(f" {'✓' if agent_3_analysis.get('analyzed') else '✗'}")
         
-        # Initialize voting structure - ALL AGENTS VOTE ON SAME FILE:LINE
+        # Initialize voting structure - ALL AGENTS VOTE ON SAME FILE:LINE with EQUAL POWER
         agent_votes = {
-            "agent_1_sast_analyzer": agent_1_analysis.get('is_vulnerable') if agent_1_analysis.get('analyzed') else None,
-            "agent_2_direct_scanner": agent_2_analysis.get('is_vulnerable') if agent_2_analysis.get('analyzed') else None,
-            "agent_3_contextual_reviewer": agent_3_analysis.get('is_vulnerable') if agent_3_analysis.get('analyzed') else None
+            "openai_gpt": agent_1_analysis.get('is_vulnerable') if agent_1_analysis.get('analyzed') else None,
+            "anthropic_claude": agent_2_analysis.get('is_vulnerable') if agent_2_analysis.get('analyzed') else None,
+            "local_ml": agent_3_analysis.get('is_vulnerable') if agent_3_analysis.get('analyzed') else None
         }
         
         # Calculate voting result
@@ -988,9 +994,9 @@ def ai_analyze_results():
                 "line": vuln.get('start', {}).get('line', 'N/A'),
             },
             "agent_analyses": {
-                "agent_1_sast_analyzer": agent_1_analysis,
-                "agent_2_direct_scanner": agent_2_analysis,
-                "agent_3_contextual_reviewer": agent_3_analysis
+                "openai_gpt": agent_1_analysis,
+                "anthropic_claude": agent_2_analysis,
+                "local_ml": agent_3_analysis
             },
             "voting": {
                 "votes": agent_votes,
@@ -1012,14 +1018,12 @@ def ai_analyze_results():
             print(f"  🟢 NOT VULNERABLE ({voting_result['vote_ratio']}) - Safe code")
         
         # Show individual agent votes
-        votes_display = []
-        for agent, vote in agent_votes.items():
-            if vote is True:
-                votes_display.append(f"✓{agent.split('_')[1]}")
-            elif vote is False:
-                votes_display.append(f"✗{agent.split('_')[1]}")
-            else:
-                votes_display.append(f"?{agent.split('_')[1]}")
+        vote_symbols = {True: "✓", False: "✗", None: "?"}
+        votes_display = [
+            f"{vote_symbols[agent_votes['openai_gpt']]}GPT",
+            f"{vote_symbols[agent_votes['anthropic_claude']]}Claude",
+            f"{vote_symbols[agent_votes['local_ml']]}ML"
+        ]
         print(f"  Votes: [{' | '.join(votes_display)}]")
         print()
     
@@ -1029,13 +1033,13 @@ def ai_analyze_results():
         "branch": BRANCH,
         "scan_metadata": {
             "total_findings": len(vulnerabilities),
-            "model_used": OPENAI_MODEL,
-            "agents_active": 3,
+            "agents_active": len(agents_available),
             "agents_total": 3,
+            "unified_voting": True,
             "agent_details": {
-                "agent_1": "SAST Result Analyzer (gpt-4.1-mini with program slicing)",
-                "agent_2": "Direct Pattern Scanner (gpt-4o-mini)",
-                "agent_3": "Contextual Security Reviewer (gpt-4o-mini)"
+                "agent_1": f"OpenAI GPT ({OPENAI_MODEL})",
+                "agent_2": f"Anthropic Claude ({CLAUDE_MODEL})",
+                "agent_3": "Local ML (CodeBERT-Phase2)"
             }
         },
         "voting_summary": {
@@ -1088,9 +1092,9 @@ def display_ai_results():
         votes = voting.get('votes', {})
         
         agents = result.get('agent_analyses', {})
-        agent_1 = agents.get('agent_1_sast_analyzer', {})
-        agent_2 = agents.get('agent_2_direct_scanner', {})
-        agent_3 = agents.get('agent_3_contextual_reviewer', {})
+        openai_agent = agents.get('openai_gpt', {})
+        claude_agent = agents.get('anthropic_claude', {})
+        local_ml_agent = agents.get('local_ml', {})
         
         print(f"\n[{i}] {semgrep.get('check_id', 'Unknown')}")
         print(f"    📍 Location: {semgrep.get('file', 'N/A')}:{semgrep.get('line', 'N/A')}")
@@ -1099,29 +1103,29 @@ def display_ai_results():
         # Show individual agent votes
         print(f"    👥 Agent Votes:")
         vote_symbols = {True: "✓ VULNERABLE", False: "✗ SAFE", None: "? NO VOTE"}
-        print(f"       Agent 1 (SAST): {vote_symbols.get(votes.get('agent_1_sast_analyzer'), '?')}")
-        print(f"       Agent 2 (Pattern): {vote_symbols.get(votes.get('agent_2_direct_scanner'), '?')}")
-        print(f"       Agent 3 (Context): {vote_symbols.get(votes.get('agent_3_contextual_reviewer'), '?')}")
+        print(f"       OpenAI GPT: {vote_symbols.get(votes.get('openai_gpt'), '?')}")
+        print(f"       Claude: {vote_symbols.get(votes.get('anthropic_claude'), '?')}")
+        print(f"       Local ML: {vote_symbols.get(votes.get('local_ml'), '?')}")
         
         # Show highest risk level from any agent
-        risk_levels = [agent_1.get('risk_level'), agent_2.get('risk_level'), agent_3.get('risk_level')]
+        risk_levels = [openai_agent.get('risk_level'), claude_agent.get('risk_level'), local_ml_agent.get('risk_level')]
         risk_levels = [r for r in risk_levels if r]
         highest_risk = max(risk_levels, key=lambda x: {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'INFO': 0}.get(x, 0)) if risk_levels else 'N/A'
         
         print(f"    🎯 Risk Level: {highest_risk} (Confidence: {vote_result.get('confidence', 'N/A')})")
         
-        # Show reasoning from agent who voted vulnerable (prefer Agent 1)
+        # Show reasoning from agent who voted vulnerable (prefer OpenAI, then Claude)
         reasoning = None
         recommendation = None
-        if agent_1.get('is_vulnerable'):
-            reasoning = agent_1.get('reasoning', '')
-            recommendation = agent_1.get('recommendation', '')
-        elif agent_2.get('is_vulnerable'):
-            reasoning = agent_2.get('reasoning', '')
-            recommendation = agent_2.get('recommendation', '')
-        elif agent_3.get('is_vulnerable'):
-            reasoning = agent_3.get('reasoning', '')
-            recommendation = agent_3.get('recommendation', '')
+        if openai_agent.get('is_vulnerable'):
+            reasoning = openai_agent.get('reasoning', '')
+            recommendation = openai_agent.get('recommendation', '')
+        elif claude_agent.get('is_vulnerable'):
+            reasoning = claude_agent.get('reasoning', '')
+            recommendation = claude_agent.get('recommendation', '')
+        elif local_ml_agent.get('is_vulnerable'):
+            reasoning = local_ml_agent.get('reasoning', '')
+            recommendation = local_ml_agent.get('recommendation', '')
         
         if reasoning:
             print(f"    💡 Analysis: {reasoning[:200]}...")

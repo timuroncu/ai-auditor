@@ -1,6 +1,12 @@
 # Environment variables
 .env
 
+# Local ML models
+models/
+*.bin
+*.safetensors
+
+
 # Python
 __pycache__/
 *.py[cod]
@@ -24,6 +30,7 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -45,4 +52,3 @@ ai_analysis.json
 # OS
 .DS_Store
 Thumbs.db
-
