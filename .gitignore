@@ -1,10 +1,17 @@
 # Environment variables
 .env
 
-# Local ML models
+# Local ML models (too large for git)
 models/
 *.bin
 *.safetensors
+
+# Node.js / React
+node_modules/
+ui/node_modules/
+ui/build/
+.npm
+*.log
 
 
 # Python
